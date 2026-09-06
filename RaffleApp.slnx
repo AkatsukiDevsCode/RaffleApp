@@ -1,0 +1,5 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RaffleApp.Api/RaffleApp.Api.csproj" />
+  </Folder>
+</Solution>

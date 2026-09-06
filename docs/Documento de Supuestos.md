@@ -1,0 +1,101 @@
+# Documento de Supuestos
+
+*Sistema de Sorteos para la Comunidad DevTalles*
+
+*Backend .NET 10, PostgreSQL, ASP.NET Core Identity, Discord OAuth2, Redis, SignalR*
+
+Este documento reúne las decisiones y suposiciones adoptadas por el equipo de desarrollo durante el análisis y diseño del sistema, en los casos en que la consigna original de la CodeQuest #1 (App para Sorteos, DevTalles) no especificaba un comportamiento exacto, o en los que el documento de arquitectura de producción amplió el alcance original sin detallar el criterio exacto de implementación.
+
+## 1. Alcance general
+
+- La aplicación está pensada exclusivamente para la comunidad de Discord de DevTalles; el sistema no es multi-tenant: el ID del servidor (Guild ID) de DevTalles se configura una única vez por variable de entorno, no se modela la posibilidad de alojar sorteos para múltiples servidores/comunidades distintas.
+- El frontend (React) y el backend (.NET) se desarrollan en repositorios de GitHub separados e independientes, ya que forman parte de un equipo con responsabilidades divididas (el autor de este documento está a cargo únicamente del backend). Esto implica que la comunicación entre ambos se resuelve exclusivamente vía API REST + JSON sobre HTTPS, sin dependencias de código compartido ni de un mismo pipeline de build.
+- Al no compartir repositorio, no existe una carpeta común de tipos/contratos compartidos (como sí podría darse en un monorepo); el contrato de la API se documenta y publica mediante Swagger/OpenAPI, generado automáticamente por el backend, como única fuente de verdad para que el equipo de frontend consuma los endpoints.
+- El idioma de la interfaz se asume español únicamente (sin selector de idioma), dado que DevTalles es una comunidad hispanohablante y el proyecto no busca alcance internacional; el código fuente (clases, tablas, endpoints, variables) se escribe en inglés, siguiendo la convención estándar de desarrollo.
+- No se modela un tema claro/oscuro seleccionable a nivel de backend, ya que es una decisión exclusivamente de presentación (frontend) que no requiere persistencia ni lógica de servidor.
+- El listado de sorteos del panel administrativo se muestra paginado, con tamaño de página seleccionable entre 10, 30 y 100 registros (10 por defecto); los endpoints de listado reciben parámetros de página y tamaño de página, y devuelven junto con los datos el total de registros para calcular la cantidad de páginas.
+- No se contempla en esta primera versión la exportación a Excel/PDF de listados o reportes, ya que la consigna original no lo solicita; el alcance se limita a administrar sorteos, participantes y ganadores desde la propia interfaz web.
+
+## 2. Usuarios, autenticación y autorización (Discord OAuth2)
+
+- El sistema no implementa un flujo de registro/login tradicional (usuario y contraseña); toda la autenticación se resuelve mediante Discord OAuth2 (Authorization Code Flow), tanto para participantes comunes como para el Admin. No existe una pantalla de "crear cuenta": el primer login vía Discord crea automáticamente el registro de Usuario.
+- Dado que backend y frontend están en repositorios y, muy probablemente, dominios distintos, el flujo de login se resuelve así: el frontend redirige al usuario a la pantalla de autorización de Discord; Discord redirige de vuelta a una ruta del frontend con un "code"; el frontend envía ese code a un endpoint del backend (POST /api/auth/discord/callback); el backend lo intercambia por el access/refresh token de Discord, obtiene el perfil del usuario, valida la pertenencia al servidor de DevTalles, crea o actualiza el Usuario, y responde con un JWT propio (emitido y firmado por el backend) que el frontend usa en el header Authorization: Bearer para el resto de los endpoints.
+- Se decide no usar cookies de sesión (HttpOnly) para no depender de configuraciones de CORS/SameSite entre dominios distintos; el JWT se entrega en el cuerpo de la respuesta, y su almacenamiento (memoria, localStorage, etc.) queda a criterio del frontend.
+- El JWT propio tiene una vida corta (por ejemplo, 1 hora); se emite junto con un refresh token propio (distinto del de Discord) para renovar la sesión sin forzar al usuario a re-autenticar contra Discord cada vez que expira.
+- Los tokens de Discord (access/refresh) del usuario se almacenan cifrados en la base de datos, ya que son necesarios para poder re-validar la pertenencia al servidor en el futuro (por ejemplo, al momento de participar en un sorteo) sin pedirle al usuario que vuelva a autorizar la aplicación cada vez.
+- La validación de "pertenencia al servidor de DevTalles" ocurre en dos momentos: (1) al hacer login, como condición para poder emitir el JWT propio (si no pertenece al servidor, el login se rechaza); y (2) nuevamente al momento de presionar "Participar" en un sorteo, ya que un usuario podría abandonar el servidor de Discord después de loguearse una vez, y la consigna exige validar la pertenencia específicamente en esa acción.
+- Se modela un único rol explícito en AspNetRoles: "Admin". Cualquier usuario autenticado que no tenga ese rol se trata como participante regular por defecto; no se crea un rol "Participante" explícito, ya que no aporta valor de negocio distinguirlo.
+- La asignación del rol Admin es exclusivamente manual, realizada directamente en la base de datos (o mediante un endpoint interno protegido, ejecutado únicamente por el equipo organizador), dado que la consigna no pide un flujo de autopostulación a administrador ni una jerarquía de roles más compleja.
+- No se utilizan el PasswordHash, el SecurityStamp ni el mecanismo de Lockout de ASP.NET Core Identity, ya que no existe un flujo de login con contraseña propia; estos campos quedan presentes en el modelo por ser parte del esquema estándar de Identity, pero no se usan en la lógica de negocio.
+- Se guarda un snapshot de los datos públicos de Discord del usuario (DiscordUsername, DiscordGlobalName/DisplayName, DiscordAvatarUrl) al momento de cada login, para no depender de una llamada en vivo a la API de Discord cada vez que se necesita mostrar el nombre o avatar de un participante en el panel admin o en la sala de sorteo.
+
+## 3. Sorteos (Raffles)
+
+- El CRUD completo de sorteos (alta, edición, baja lógica) está restringido exclusivamente al rol Admin, mediante [Authorize(Roles = "Admin")] en todos los endpoints correspondientes.
+- Pueden existir múltiples sorteos activos en simultáneo; no se modela un límite de sorteos concurrentes.
+- Un sorteo se considera "abierto para participar" cuando IsActive = true Y la fecha/hora actual (UTC) se encuentra entre StartDate y EndDate; si cualquiera de las dos condiciones falla, el botón de participar se deshabilita en el frontend y el endpoint de participación rechaza la solicitud en el backend.
+- El Admin puede editar libremente cualquier campo del sorteo (título, descripción, fechas) mientras no se haya seleccionado un ganador (WinnerId = null); una vez que el sorteo tiene ganador, se vuelve de solo lectura a efectos de fechas y título, para preservar la integridad del historial ya comunicado a la comunidad.
+- El Admin puede cerrar un sorteo anticipadamente (antes de EndDate) marcando IsActive = false sin seleccionar ganador, por ejemplo si necesita cancelarlo; en ese caso el sorteo queda cerrado sin WinnerId, y no vuelve a reabrirse automáticamente.
+- No se modela un campo estructurado de "premio"; la descripción del premio se asume incluida como texto libre dentro del campo Description, ya que la consigna original no especifica una estructura particular para premios (podría ser una suscripción, mercadería, cupos a un curso, etc., variable según el sorteo).
+- La baja de un sorteo (eliminación lógica) es posible en cualquier momento de su ciclo de vida, incluso con ganador ya seleccionado, pero nunca se elimina físicamente el registro, para no perder trazabilidad de sorteos ya comunicados a la comunidad.
+
+## 4. Participaciones (RaffleEntries) y prevención de bots
+
+- RaffleEntry hereda del mismo esquema estándar de auditoría (CreatedAt/CreatedBy, IsDeleted, etc.) que el resto de las entidades del dominio, aun cuando conceptualmente una participación no se "edita": esto permite registrar el momento exacto en que el usuario se unió (CreatedAt = JoinedAt) y, si fuera necesario, invalidar manualmente una participación puntual detectada como fraudulenta (IsDeleted = true) sin perder el registro histórico de que existió.
+- La clave primaria compuesta (RaffleId, UserId) impide a nivel de base de datos que un mismo usuario participe dos veces en el mismo sorteo; si el usuario ya está participando y vuelve a presionar "Participar", el endpoint responde de forma idempotente e informativa (no como un error 500 de restricción violada).
+- No se contempla la posibilidad de que un usuario cancele su propia participación una vez registrada, ya que no fue solicitado en la consigna original y simplifica las garantías de igualdad de oportunidades entre participantes.
+- El endpoint POST /api/raffles/{id}/participate aplica Rate Limiting nativo de .NET con un límite concreto asumido de 5 solicitudes por minuto por usuario autenticado (por UserId, no por IP), ya que un usuario legítimo participando en un sorteo genuino no necesita más de 1-2 intentos; este límite se aplica además de, no en reemplazo de, la validación de pertenencia al servidor de Discord.
+- La revalidación de pertenencia al servidor de Discord en el momento de participar se realiza mediante una llamada a la API de Discord (GET /guilds/{guildId}/members/{userId}) usando el token del bot de la aplicación, asumiendo que el bot de DevTalles ya se encuentra agregado al servidor con permisos de lectura de miembros; no se usa el access token del propio usuario para esta verificación puntual, para no depender de que su sesión OAuth siga vigente en Discord en ese instante.
+
+## 5. Selección de ganador y concurrencia
+
+- La selección de ganador es siempre una acción manual disparada por el Admin (botón "Seleccionar ganador"); no existe un job en segundo plano que cierre sorteos ni elija ganadores automáticamente al llegar EndDate.
+- Se asume que la selección de ganador solo puede ejecutarse cuando la fecha/hora actual ya alcanzó o superó el EndDate del sorteo, para evitar que un Admin cierre la participación anticipadamente de forma injusta para la comunidad; la única forma de finalizar un sorteo antes de su EndDate es cancelándolo sin ganador (ver sección 3).
+- El algoritmo de selección utiliza un generador de números aleatorios criptográficamente seguro (System.Security.Cryptography.RandomNumberGenerator) en lugar de System.Random, para garantizar una aleatoriedad verdadera y no determinista frente a la comunidad; esta lógica se encapsula detrás de una interfaz inyectable (ej. IWinnerSelector), precisamente para poder testearla con Moq/xUnit sin depender de la implementación real de aleatoriedad.
+- Se permite que el Admin vuelva a sortear (re-draw) un sorteo ya finalizado, seleccionando un nuevo ganador entre los participantes restantes (excluyendo al ganador anterior), para cubrir casos reales como que el ganador original no responda o resulte inelegible; cada cambio de WinnerId queda registrado en el bloque de auditoría estándar (UpdatedAt/UpdatedBy), y adicionalmente se conserva un historial simple de ganadores anteriores del sorteo (tabla RaffleWinnerHistory) para no perder trazabilidad ante un reclamo de la comunidad.
+- Se configura un Concurrency Token sobre la entidad Sorteo usando la columna de sistema nativa xmin de PostgreSQL (mapeada por EF Core como shadow property), en lugar de mantener una columna propia tipo RowVersion; adicionalmente, la operación de seleccionar ganador valida a nivel de aplicación que WinnerId sea nulo antes de escribir (o, en el caso de un re-draw, que se trate explícitamente de esa operación), de modo que si dos solicitudes de "seleccionar ganador" llegan casi simultáneamente para el mismo sorteo, la segunda falla con un mensaje claro ("este sorteo ya tiene un ganador") en lugar de sobrescribir silenciosamente el resultado.
+
+## 6. Notificaciones en tiempo real (SignalR)
+
+- Se implementa un Hub de SignalR con un grupo por sorteo (RaffleId), al que los clientes conectados a la "Sala de Sorteo" se suscriben mientras visualizan ese sorteo en particular.
+- El evento principal transmitido es WinnerAnnounced (RaffleId, DiscordUsername, DiscordAvatarUrl), emitido inmediatamente después de que el Admin confirma la selección del ganador, para que todos los clientes conectados vean el resultado sin recargar la página.
+- Como mejora adicional, no solicitada explícitamente pero de bajo costo dado que ya existe la infraestructura de SignalR, se transmite también un evento ParticipantCountUpdated cada vez que un nuevo usuario se une a un sorteo abierto, para que la comunidad vea crecer la cantidad de participantes en tiempo real mientras espera el sorteo.
+- No se contempla persistir un historial de mensajes del Hub ni reintentos de entrega garantizada; si un cliente se desconecta y reconecta, simplemente vuelve a unirse al grupo y consulta el estado actual del sorteo vía API REST (un WinnerAnnounced ya emitido no se reenvía retroactivamente por SignalR, pero se refleja igual al recargar el estado por API).
+
+## 7. Caché y rendimiento (Redis)
+
+- La clave de caché para la lista de "Sorteos Activos" de la Landing Page se invalida explícitamente (no por expiración) cada vez que un Admin crea, edita, cierra o selecciona un ganador para un sorteo, ya que cualquiera de esas acciones puede afectar qué sorteos deben mostrarse como activos.
+- Como red de seguridad ante una posible invalidación no disparada correctamente (por ejemplo, un deploy a mitad de una operación), se configura adicionalmente un TTL absoluto de 10 minutos sobre esa misma clave, para que el caché nunca quede desactualizado indefinidamente aunque falle la invalidación explícita.
+- La vista de detalle de un sorteo individual no se cachea en esta primera versión, ya que se asume un volumen de tráfico bajo por sorteo puntual comparado con el listado general de la Landing Page.
+- El conteo de participantes de un sorteo (usado tanto en el listado como en el evento ParticipantCountUpdated de SignalR) se lee directamente de PostgreSQL en cada solicitud, sin cachear, dado que es un valor que cambia con alta frecuencia mientras el sorteo está abierto, y cachearlo introduciría más complejidad de invalidación de la que amerita.
+
+## 8. Gestión de zonas horarias
+
+- Todas las fechas (StartDate, EndDate, CreatedAt, y en general cualquier campo de auditoría) se almacenan y procesan en el backend exclusivamente en UTC, incluyendo la comparación de StartDate/EndDate contra la fecha actual al validar si un sorteo está abierto.
+- Se asume que la comunidad de DevTalles, al ser hispanohablante pero distribuida en varios países (México, España, Colombia, Argentina, etc.), requiere que cada participante vea las fechas de inicio/fin del sorteo convertidas a su propia zona horaria local (resuelto en el frontend mediante el objeto Intl del navegador), y no en una única zona horaria fija de referencia.
+- No se le solicita al usuario ni se persiste su zona horaria; se asume siempre la del navegador en el momento de la visita, de forma consistente con el motor de conversión ya definido en el documento de arquitectura del proyecto.
+
+## 9. Auditoría y eliminación lógica
+
+- Todas las entidades de dominio (Sorteo, RaffleEntry, y la tabla de historial de ganadores) heredan de la clase base AuditableEntity (CreatedAt/CreatedBy, UpdatedAt/UpdatedBy, IsDeleted/DeletedAt/DeletedBy), poblada automáticamente mediante SaveChanges Interceptors de EF Core, sin intervención manual del desarrollador en cada operación.
+- Se aplican Global Query Filters (HasQueryFilter(e => !e.IsDeleted)) en el DbContext para ocultar automáticamente los registros eliminados lógicamente de cualquier consulta estándar, salvo que se trate explícitamente de una pantalla de auditoría/histórico (no contemplada en esta primera versión, pero el modelo queda preparado para soportarla a futuro).
+- Se elige eliminación lógica en lugar de física en todos los casos, incluyendo sorteos ya finalizados con ganador, para que la comunidad pueda auditar en cualquier momento que un sorteo determinado efectivamente se realizó de forma transparente, incluso si el Admin decide ocultarlo del listado activo.
+- Los campos CreatedBy/UpdatedBy/DeletedBy de cada entidad almacenan el Id del Usuario (Admin) que ejecutó la acción, obtenido del JWT de la sesión autenticada; no se registran acciones anónimas, ya que todas las operaciones de escritura (crear sorteo, participar, seleccionar ganador) requieren un usuario autenticado.
+
+## 10. Observabilidad, testing y CI
+
+- Se utiliza Serilog con salida a consola (formato JSON estructurado) más un sink de archivo con rolling diario, incluyendo en cada log de negocio relevante el RaffleId y/o UserId correspondiente, para poder correlacionar rápidamente incidentes reportados por la comunidad (por ejemplo, "no pude participar en el sorteo X") con las trazas del backend.
+- Se exponen endpoints de healthcheck (/health) verificando la disponibilidad de: la propia API, la conexión a PostgreSQL, la conexión a Redis, y la alcanzabilidad de la API de Discord (ping simple al endpoint /gateway), para que Docker Compose y cualquier orquestador puedan determinar si el sistema está realmente operativo en su totalidad.
+- Las pruebas unitarias con xUnit y Moq se enfocan prioritariamente en: el servicio de selección de ganadores (IWinnerSelector, verificando distribución razonable de aleatoriedad sobre múltiples ejecuciones), los validadores de DTOs (fechas de sorteo coherentes, StartDate < EndDate), y las reglas de negocio de participación (rechazo si el sorteo no está abierto, rechazo de doble participación).
+- No se fija un porcentaje mínimo de cobertura de código exigido en esta primera versión (por ejemplo, vía Coverlet), ya que no fue solicitado explícitamente y se prioriza cobertura de calidad sobre cobertura de cantidad en los módulos críticos mencionados arriba.
+- El pipeline de GitHub Actions del repositorio de backend ejecuta, en cada Pull Request hacia la rama principal: restore, build, linter (dotnet format --verify-no-changes) y la suite completa de pruebas con xUnit; no incluye despliegue automático a producción en esta primera versión, ya que la infraestructura de despliegue final se define en un documento de configuración aparte.
+
+## 11. Infraestructura, despliegue y contrato con el frontend
+
+- El entorno de desarrollo local se levanta con Docker Compose, incluyendo contenedores para PostgreSQL y Redis; la API de .NET puede ejecutarse dentro del mismo Docker Compose o directamente desde el entorno local del desarrollador (por ejemplo, dotnet run), según preferencia, ya que ambas opciones son válidas para el desarrollo diario del backend.
+- El entorno de producción se asume desplegado en un servicio de hosting en la nube a definir más adelante (fuera del alcance de este documento), de forma independiente del repositorio y despliegue del frontend, dado que ambos viven en repositorios separados.
+- Dado que backend y frontend están en dominios distintos, se configura CORS en el backend permitiendo explícitamente el o los orígenes del frontend (vía variable de entorno, para diferenciar entre entorno local y producción), en lugar de permitir cualquier origen (*).
+- El contrato de la API se documenta y publica mediante Swagger/OpenAPI (accesible en entornos de desarrollo/staging, no necesariamente en producción), como principal mecanismo de sincronización entre el equipo de backend y el de frontend al no compartir el mismo repositorio.
+- Las credenciales sensibles (cadena de conexión a PostgreSQL, credenciales del bot de Discord, Client ID/Secret de la aplicación OAuth de Discord, clave de firma de los JWT propios) se gestionan mediante variables de entorno / user-secrets, y no se versionan en el repositorio de GitHub del backend.
+
+*Nota: este documento es un artefacto vivo y debe actualizarse a medida que el equipo tome nuevas decisiones de diseño durante el desarrollo.*
